@@ -1,202 +1,289 @@
 # journey_processor/services/condition_evaluator.py
 
 import logging
-import re
-import operator
-from datetime import timedelta
-from django.utils import timezone
+import json
 from django.db.models import Q
+from django.utils import timezone
+
+from external_models.models.journeys import JourneyStepConnection
+from external_models.models.nurturing_campaigns import LeadNurturingParticipant
+from crm.models import Lead, FunnelStep
 
 logger = logging.getLogger(__name__)
 
 
 class ConditionEvaluator:
     """
-    Evaluates conditions for journey branching logic
-    This handles complex condition evaluation against lead properties
-    and related model data
+    Service class for evaluating journey step conditions
+    Handles validation of conditions for step transitions
     """
 
-    # Map of operator names to functions
-    OPERATORS = {
-        'eq': operator.eq,
-        'neq': operator.ne,
-        'gt': operator.gt,
-        'lt': operator.lt,
-        'gte': operator.ge,
-        'lte': operator.le,
-        'contains': lambda a, b: b in a if a is not None and isinstance(a, (str, list)) else False,
-        'not_contains': lambda a, b: b not in a if a is not None and isinstance(a, (str, list)) else True,
-        'starts_with': lambda a, b: a.startswith(b) if a is not None and isinstance(a, str) else False,
-        'ends_with': lambda a, b: a.endswith(b) if a is not None and isinstance(a, str) else False,
-        'matches': lambda a, b: bool(re.match(b, a)) if a is not None and isinstance(a, str) else False,
-        'is_empty': lambda a, b: a is None or a == '',
-        'is_not_empty': lambda a, b: a is not None and a != '',
-        'in_past': lambda a, b: a < timezone.now() if a is not None else False,
-        'in_future': lambda a, b: a > timezone.now() if a is not None else False,
-        'days_ago': lambda a, b: (timezone.now() - a).days > int(b) if a is not None else False,
-        'within_days': lambda a, b: (timezone.now() - a).days <= int(b) if a is not None else False,
-        'in_list': lambda a, b: a in b if isinstance(b, (list, tuple)) else False,
-        'not_in_list': lambda a, b: a not in b if isinstance(b, (list, tuple)) else True,
-    }
-
-    def evaluate(self, lead, condition_config):
+    def evaluate(self, connection, participant, event_data=None):
         """
-        Evaluate a condition against a lead
+        Evaluate if a connection's conditions are met for a participant
 
         Args:
-            lead: Lead model instance
-            condition_config: Dict with condition configuration:
-                {
-                    'type': 'field_condition',  # or 'combined_condition'
-                    'field': 'field_name' or 'model.field_name',
-                    'operator': 'eq',  # One of OPERATORS keys
-                    'value': comparison value
-                }
+            connection: JourneyStepConnection instance
+            participant: LeadNurturingParticipant instance
+            event_data: Optional dictionary with event data
 
         Returns:
-            bool: Whether the condition is met
+            bool: True if conditions are met, False otherwise
         """
-        try:
-            condition_type = condition_config.get('type', 'field_condition')
+        if not connection.conditions:
+            return True
 
-            if condition_type == 'field_condition':
-                return self._evaluate_field_condition(lead, condition_config)
-            elif condition_type == 'combined_condition':
-                return self._evaluate_combined_condition(lead, condition_config)
-            else:
-                logger.warning(f"Unknown condition type: {condition_type}")
+        try:
+            conditions = json.loads(connection.conditions)
+        except json.JSONDecodeError:
+            logger.error(f"Invalid conditions JSON for connection {connection.id}")
+            return False
+
+        if not conditions:
+            return True
+
+        # Evaluate each condition group (AND logic between groups)
+        for group in conditions:
+            if not self._evaluate_group(group, participant, event_data):
                 return False
 
+        return True
+
+    def _evaluate_group(self, group, participant, event_data):
+        """
+        Evaluate a group of conditions (OR logic within group)
+
+        Args:
+            group: List of condition dictionaries
+            participant: LeadNurturingParticipant instance
+            event_data: Optional dictionary with event data
+
+        Returns:
+            bool: True if any condition in group is met, False otherwise
+        """
+        if not group:
+            return True
+
+        # Evaluate each condition in the group (OR logic)
+        for condition in group:
+            if self._evaluate_condition(condition, participant, event_data):
+                return True
+
+        return False
+
+    def _evaluate_condition(self, condition, participant, event_data):
+        """
+        Evaluate a single condition
+
+        Args:
+            condition: Dictionary with condition details
+            participant: LeadNurturingParticipant instance
+            event_data: Optional dictionary with event data
+
+        Returns:
+            bool: True if condition is met, False otherwise
+        """
+        condition_type = condition.get('type')
+        if not condition_type:
+            return False
+
+        # Get the appropriate evaluator method
+        evaluator = getattr(self, f'_evaluate_{condition_type}', None)
+        if not evaluator:
+            logger.warning(f"Unknown condition type: {condition_type}")
+            return False
+
+        try:
+            return evaluator(condition, participant, event_data)
         except Exception as e:
             logger.exception(f"Error evaluating condition: {e}")
             return False
 
-    def _evaluate_field_condition(self, lead, condition_config):
-        """
-        Evaluate a condition based on field value
-
-        Args:
-            lead: Lead model instance
-            condition_config: Condition configuration dict
-
-        Returns:
-            bool: Whether the condition is met
-        """
-        field = condition_config.get('field')
-        if not field:
-            logger.warning("Missing field in condition configuration")
+    def _evaluate_funnel_step(self, condition, participant, event_data):
+        """Evaluate if lead is in specified funnel step"""
+        funnel_step_id = condition.get('funnel_step_id')
+        if not funnel_step_id:
             return False
 
-        op_name = condition_config.get('operator', 'eq')
-        compare_value = condition_config.get('value')
-
-        # Get the current value from the lead or related models
-        current_value = self._get_field_value(lead, field)
-
-        # Get the operator function
-        op_func = self.OPERATORS.get(op_name)
-        if not op_func:
-            logger.warning(f"Unknown operator: {op_name}")
-            return False
-
-        # Type conversion for numeric comparisons if needed
-        if op_name in ('gt', 'lt', 'gte', 'lte') and current_value is not None:
-            try:
-                if isinstance(compare_value, str) and compare_value.isdigit():
-                    compare_value = int(compare_value)
-                if isinstance(current_value, str) and current_value.isdigit():
-                    current_value = int(current_value)
-            except (ValueError, TypeError):
-                pass
-
-        # Compare the values
         try:
-            result = op_func(current_value, compare_value)
-            logger.debug(f"Condition '{field} {op_name} {compare_value}': {result} (current value: {current_value})")
-            return result
-        except (TypeError, ValueError) as e:
-            logger.warning(f"Error comparing values ({current_value} {op_name} {compare_value}): {e}")
+            return participant.lead.funnel_step_id == funnel_step_id
+        except Exception as e:
+            logger.exception(f"Error checking funnel step: {e}")
             return False
 
-    def _evaluate_combined_condition(self, lead, condition_config):
-        """
-        Evaluate a combination of conditions with AND/OR logic
-
-        Args:
-            lead: Lead model instance
-            condition_config: Dict with combined conditions configuration:
-                {
-                    'type': 'combined_condition',
-                    'operator': 'and' or 'or',
-                    'conditions': [condition1, condition2, ...]
-                }
-
-        Returns:
-            bool: Whether the combined condition is met
-        """
-        operator_type = condition_config.get('operator', 'and').lower()
-        conditions = condition_config.get('conditions', [])
-
-        if not conditions:
-            logger.warning("No conditions in combined_condition")
+    def _evaluate_lead_status(self, condition, participant, event_data):
+        """Evaluate lead status condition"""
+        status = condition.get('status')
+        if not status:
             return False
 
-        if operator_type == 'and':
-            for condition in conditions:
-                if not self.evaluate(lead, condition):
-                    return False
-            return True
-        elif operator_type == 'or':
-            for condition in conditions:
-                if self.evaluate(lead, condition):
-                    return True
-            return False
-        else:
-            logger.warning(f"Unknown combination operator: {operator_type}")
+        try:
+            return participant.lead.status == status
+        except Exception as e:
+            logger.exception(f"Error checking lead status: {e}")
             return False
 
-    def _get_field_value(self, lead, field):
-        """
-        Get a field value from the lead or related models
-        Supports dot notation for related models and custom fields
+    def _evaluate_lead_score(self, condition, participant, event_data):
+        """Evaluate lead score condition"""
+        operator = condition.get('operator')
+        value = condition.get('value')
 
-        Args:
-            lead: Lead model instance
-            field: Field name, which can include dots for related models
-                   e.g., 'first_name', 'funnel_step.name', 'custom.field_name'
+        if not operator or value is None:
+            return False
 
-        Returns:
-            The field value or None if not found
-        """
-        # Handle special field types
-        if field.startswith('custom.'):
-            # Custom field access through the field_values model
-            custom_field_name = field.replace('custom.', '')
-            try:
-                field_value = lead.field_values.filter(
-                    field_definition__api_name=custom_field_name
-                ).first()
-                return field_value.value if field_value else None
-            except Exception as e:
-                logger.warning(f"Error accessing custom field {custom_field_name}: {e}")
-                return None
+        try:
+            lead_score = participant.lead.score or 0
+            if operator == 'gt':
+                return lead_score > value
+            elif operator == 'gte':
+                return lead_score >= value
+            elif operator == 'lt':
+                return lead_score < value
+            elif operator == 'lte':
+                return lead_score <= value
+            elif operator == 'eq':
+                return lead_score == value
+            else:
+                logger.warning(f"Unknown operator: {operator}")
+                return False
+        except Exception as e:
+            logger.exception(f"Error checking lead score: {e}")
+            return False
 
-        # Check for relationship traversal
-        if '.' in field:
-            parts = field.split('.')
-            obj = lead
+    def _evaluate_lead_property(self, condition, participant, event_data):
+        """Evaluate lead property condition"""
+        property_name = condition.get('property')
+        operator = condition.get('operator')
+        value = condition.get('value')
 
-            for part in parts[:-1]:
-                if not hasattr(obj, part):
-                    return None
+        if not property_name or not operator or value is None:
+            return False
 
-                obj = getattr(obj, part)
-                if obj is None:
-                    return None
+        try:
+            # Get property value from lead
+            property_value = getattr(participant.lead, property_name, None)
+            if property_value is None:
+                return False
 
-            last_part = parts[-1]
-            return getattr(obj, last_part, None)
+            # Compare values based on operator
+            if operator == 'eq':
+                return property_value == value
+            elif operator == 'neq':
+                return property_value != value
+            elif operator == 'contains':
+                return str(value) in str(property_value)
+            elif operator == 'not_contains':
+                return str(value) not in str(property_value)
+            else:
+                logger.warning(f"Unknown operator: {operator}")
+                return False
+        except Exception as e:
+            logger.exception(f"Error checking lead property: {e}")
+            return False
 
-        # Direct attribute access
-        return getattr(lead, field, None)
+    def _evaluate_event_property(self, condition, participant, event_data):
+        """Evaluate event property condition"""
+        if not event_data:
+            return False
+
+        property_name = condition.get('property')
+        operator = condition.get('operator')
+        value = condition.get('value')
+
+        if not property_name or not operator or value is None:
+            return False
+
+        try:
+            # Get property value from event data
+            property_value = event_data.get(property_name)
+            if property_value is None:
+                return False
+
+            # Compare values based on operator
+            if operator == 'eq':
+                return property_value == value
+            elif operator == 'neq':
+                return property_value != value
+            elif operator == 'contains':
+                return str(value) in str(property_value)
+            elif operator == 'not_contains':
+                return str(value) not in str(property_value)
+            else:
+                logger.warning(f"Unknown operator: {operator}")
+                return False
+        except Exception as e:
+            logger.exception(f"Error checking event property: {e}")
+            return False
+
+    def _evaluate_time_elapsed(self, condition, participant, event_data):
+        """Evaluate time elapsed condition"""
+        step_id = condition.get('step_id')
+        operator = condition.get('operator')
+        value = condition.get('value')
+
+        if not step_id or not operator or value is None:
+            return False
+
+        try:
+            # Get the last enter_step event for the specified step
+            last_enter = participant.events.filter(
+                journey_step_id=step_id,
+                event_type='enter_step'
+            ).order_by('-event_timestamp').first()
+
+            if not last_enter:
+                return False
+
+            # Calculate elapsed time in seconds
+            elapsed = timezone.now() - last_enter.event_timestamp
+            elapsed_seconds = elapsed.total_seconds()
+
+            # Compare elapsed time based on operator
+            if operator == 'gt':
+                return elapsed_seconds > value
+            elif operator == 'gte':
+                return elapsed_seconds >= value
+            elif operator == 'lt':
+                return elapsed_seconds < value
+            elif operator == 'lte':
+                return elapsed_seconds <= value
+            else:
+                logger.warning(f"Unknown operator: {operator}")
+                return False
+        except Exception as e:
+            logger.exception(f"Error checking time elapsed: {e}")
+            return False
+
+    def _evaluate_step_count(self, condition, participant, event_data):
+        """Evaluate step count condition"""
+        step_type = condition.get('step_type')
+        operator = condition.get('operator')
+        value = condition.get('value')
+
+        if not step_type or not operator or value is None:
+            return False
+
+        try:
+            # Count events of specified step type
+            count = participant.events.filter(
+                journey_step__step_type=step_type,
+                event_type='enter_step'
+            ).count()
+
+            # Compare count based on operator
+            if operator == 'gt':
+                return count > value
+            elif operator == 'gte':
+                return count >= value
+            elif operator == 'lt':
+                return count < value
+            elif operator == 'lte':
+                return count <= value
+            elif operator == 'eq':
+                return count == value
+            else:
+                logger.warning(f"Unknown operator: {operator}")
+                return False
+        except Exception as e:
+            logger.exception(f"Error checking step count: {e}")
+            return False

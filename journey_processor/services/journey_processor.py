@@ -6,10 +6,8 @@ from django.db import transaction
 from django.utils import timezone
 from django.db.models import Q
 
-from acs.models import (
-    Journey, JourneyStep, JourneyStepConnection,
-    JourneyParticipant, JourneyEvent, LeadNurturingCampaign
-)
+from external_models.models.journeys import Journey, JourneyStep, JourneyStepConnection, JourneyEvent
+from external_models.models.nurturing_campaigns import LeadNurturingParticipant
 from crm.models import Lead, FunnelStep
 from journey_processor.services.condition_evaluator import ConditionEvaluator
 
@@ -29,8 +27,10 @@ class JourneyProcessor:
         self.step_processors = {
             'email': self._process_email_step,
             'sms': self._process_sms_step,
-            'delay': self._process_delay_step,
-            'condition': self._process_condition_step,
+            'voice': self._process_voice_step,
+            'chat': self._process_chat_step,
+            'wait_step': self._process_wait_step,
+            'validation_step': self._process_validation_step,
             'goal': self._process_goal_step,
             'webhook': self._process_webhook_step,
             'end': self._process_end_step
@@ -42,7 +42,7 @@ class JourneyProcessor:
         or handle their current step
 
         Args:
-            participant: JourneyParticipant instance
+            participant: LeadNurturingParticipant instance
         """
         if not participant.is_active:
             logger.debug(f"Skipping inactive participant {participant}")
@@ -66,7 +66,7 @@ class JourneyProcessor:
         logger.info("Processing timed connections...")
 
         # Find all active participants with a current step
-        active_participants = JourneyParticipant.objects.filter(
+        active_participants = LeadNurturingParticipant.objects.filter(
             status='active',
             current_step__isnull=False
         ).select_related('current_step', 'journey', 'lead')
@@ -120,17 +120,17 @@ class JourneyProcessor:
 
         if participant_id:
             try:
-                participants = [JourneyParticipant.objects.get(
+                participants = [LeadNurturingParticipant.objects.get(
                     id=participant_id,
                     status='active'
                 )]
-            except JourneyParticipant.DoesNotExist:
+            except LeadNurturingParticipant.DoesNotExist:
                 logger.warning(f"Participant {participant_id} not found")
                 return 0
 
         elif lead_id:
             try:
-                participants = JourneyParticipant.objects.filter(
+                participants = LeadNurturingParticipant.objects.filter(
                     lead_id=lead_id,
                     status='active'
                 ).select_related('current_step', 'journey', 'lead')
@@ -189,7 +189,11 @@ class JourneyProcessor:
         logger.info(f"Assigning participant {participant.id} to entry point {entry_point.name}")
 
         # Move to the entry point
-        participant.move_to_next_step(entry_point, 'enter_journey', {
+        participant.current_step = entry_point
+        participant.save()
+
+        # Create entry event
+        self._create_event(participant, entry_point, 'enter_step', {
             'entry_type': 'initial',
             'journey_id': str(participant.journey.id)
         })
@@ -219,7 +223,7 @@ class JourneyProcessor:
 
         # If the step processing indicates immediate transition, handle it
         if result.get('transition_immediately', False):
-            # Find the next connection based on priority
+            # Find immediate connections
             connections = current_step.next_connections.filter(
                 trigger_type='immediate',
                 is_active=True
@@ -234,7 +238,7 @@ class JourneyProcessor:
         Move a participant from one step to another
 
         Args:
-            participant: JourneyParticipant instance
+            participant: LeadNurturingParticipant instance
             connection: JourneyStepConnection instance
             event: Optional event data that triggered this transition
         """
@@ -252,17 +256,23 @@ class JourneyProcessor:
                     'event_data': event
                 })
 
-                # Move the participant to the next step
-                participant.move_to_next_step(to_step, 'enter_step', {
-                    'from_step_id': str(from_step.id),
-                    'connection_id': str(connection.id)
+                # Update participant's current step
+                participant.current_step = to_step
+                participant.save()
+
+                # Record entry to new step
+                self._create_event(participant, to_step, 'enter_step', {
+                    'previous_step_id': str(from_step.id),
+                    'connection_id': str(connection.id),
+                    'trigger_event': event.get('type') if event else None
                 })
 
-                # Process the new step immediately if needed
-                if to_step.step_type in ['condition', 'webhook', 'end']:
-                    self._process_step(participant)
+                # Process the new step
+                self._process_step(participant)
+
         except Exception as e:
             logger.exception(f"Error transitioning participant {participant.id}: {e}")
+            raise
 
     def _get_event_connections(self, participant, event_type, data):
         """Get connections that might be triggered by this event"""
@@ -302,458 +312,210 @@ class JourneyProcessor:
         return connections
 
     def _should_trigger_delay(self, participant, connection):
-        """
-        Check if a delay connection should trigger for participant
+        """Check if a delay connection should trigger for participant"""
+        if connection.trigger_type != 'delay':
+            return False
 
-        Args:
-            participant: JourneyParticipant instance
-            connection: JourneyStepConnection instance with trigger_type='delay'
-
-        Returns:
-            bool: Whether the delay has passed and connection should trigger
-        """
-        # Find the last time the participant entered this step
-        last_entry_event = participant.events.filter(
-            journey_step=participant.current_step,
+        # Get the last enter_step event for this step
+        last_enter = JourneyEvent.objects.filter(
+            participant=participant,
+            journey_step=connection.from_step,
             event_type='enter_step'
         ).order_by('-event_timestamp').first()
 
-        if not last_entry_event:
-            logger.warning(
-                f"No enter_step event found for participant {participant.id} at step {participant.current_step.name}")
+        if not last_enter:
             return False
 
-        # Calculate the delay
-        delay_seconds = self._get_delay_in_seconds(connection)
-        if delay_seconds <= 0:
-            logger.warning(f"Invalid delay duration: {delay_seconds} seconds")
+        # Check if delay duration has elapsed
+        delay_seconds = connection.get_delay_in_seconds()
+        if not delay_seconds:
             return False
 
-        # Check if enough time has passed
-        time_elapsed = timezone.now() - last_entry_event.event_timestamp
-        return time_elapsed.total_seconds() >= delay_seconds
+        elapsed = timezone.now() - last_enter.event_timestamp
+        return elapsed.total_seconds() >= delay_seconds
 
     def _should_trigger_event(self, participant, connection, event):
-        """
-        Check if an event-based connection should trigger for participant
-
-        Args:
-            participant: JourneyParticipant instance
-            connection: JourneyStepConnection instance
-            event: Event data dict
-
-        Returns:
-            bool: Whether the connection should trigger
-        """
-        event_type = event.get('type')
-        event_data = event.get('data', {})
-
-        # Basic checks
-        if participant.current_step_id != connection.from_step_id:
-            return False
-
-        # Event type connections
-        if connection.trigger_type == 'event' and connection.event_type == event_type:
-            return True
-
-        # Funnel step change connections
-        if (connection.trigger_type == 'funnel_change' and
-                event_type == 'funnel_step_changed' and
-                connection.funnel_step_id == event_data.get('funnel_step_id')):
-            return True
-
-        # Manual trigger connections
-        if (connection.trigger_type == 'manual' and
-                event_type == 'manual_trigger' and
-                connection.id == event_data.get('connection_id')):
-            return True
-
-        return False
-
-    def _get_delay_in_seconds(self, connection):
-        """Convert a delay connection's duration to seconds"""
-        if not connection.delay_duration:
-            return 0
-
-        # Multiplication factors for different time units
-        unit_factors = {
-            'seconds': 1,
-            'minutes': 60,
-            'hours': 3600,
-            'days': 86400,
-            'weeks': 604800
-        }
-
-        unit = connection.delay_unit or 'seconds'
-        factor = unit_factors.get(unit, 1)
-
-        return connection.delay_duration * factor
+        """Check if an event-based connection should trigger for participant"""
+        if connection.trigger_type == 'condition':
+            return connection.should_trigger(participant, event)
+        return True
 
     def _create_event(self, participant, step, event_type, metadata=None):
-        """
-        Create a journey event record
-
-        Args:
-            participant: JourneyParticipant instance
-            step: JourneyStep instance
-            event_type: String event type
-            metadata: Optional JSON-serializable metadata
-        """
-        try:
-            event = JourneyEvent.objects.create(
-                participant=participant,
-                journey_step=step,
-                event_type=event_type,
-                metadata=metadata,
-                created_by=participant.last_updated_by
-            )
-            logger.debug(f"Created event {event_type} for participant {participant.id} at step {step.name}")
-            return event
-        except Exception as e:
-            logger.exception(f"Error creating journey event: {e}")
-            return None
-
-    # Step processors for different step types
+        """Create a journey event record"""
+        return JourneyEvent.objects.create(
+            participant=participant,
+            journey_step=step,
+            event_type=event_type,
+            metadata=metadata or {}
+        )
 
     def _process_email_step(self, participant, step):
-        """
-        Process an email step
+        """Process an email step"""
+        template = step.template
+        if not template:
+            logger.error(f"Email step {step.id} has no template")
+            return {'success': False}
 
-        Returns a result dict with:
-            success: Whether the email was sent successfully
-            transition_immediately: Whether to transition immediately to next step
-        """
-        if not step.template:
-            logger.error(f"Email step {step.name} has no template")
-            self._create_event(participant, step, 'error', {
-                'error': 'No template configured for email step'
-            })
-            return {'success': False, 'transition_immediately': False}
-
-        # Get the lead's email
-        lead = participant.lead
-        if not lead.email:
-            logger.warning(f"Cannot send email to lead {lead.id} with no email address")
-            self._create_event(participant, step, 'error', {
-                'error': 'Lead has no email address'
-            })
-            return {'success': False, 'transition_immediately': True}
-
+        # Send email using template
+        # Implementation depends on your email sending service
         try:
-            # Create the event first (would be updated with tracking info)
-            event = self._create_event(participant, step, 'action_sent', {
-                'action_type': 'email',
-                'template_id': str(step.template.id),
-                'recipient': lead.email
+            # TODO: Implement email sending
+            self._create_event(participant, step, 'action_sent', {
+                'template_id': str(template.id)
             })
-
-            # This is where you would integrate with your email service
-            # For example:
-            # email_service.send_email(
-            #     to_email=lead.email,
-            #     template_id=step.template.id,
-            #     context={
-            #         'lead': lead,
-            #         'participant': participant,
-            #         'journey': participant.journey,
-            #         'tracking_id': str(event.id) if event else None
-            #     }
-            # )
-
-            # For now, we'll just log the email sending
-            logger.info(f"Would send email to {lead.email} using template {step.template.id}")
-
             return {'success': True, 'transition_immediately': True}
-
         except Exception as e:
-            logger.exception(f"Error sending email for {participant.id} at {step.name}: {e}")
-            self._create_event(participant, step, 'error', {
-                'error': str(e),
-                'action_type': 'email'
-            })
-            return {'success': False, 'transition_immediately': True}
+            logger.exception(f"Error sending email for step {step.id}: {e}")
+            return {'success': False}
 
     def _process_sms_step(self, participant, step):
-        """
-        Process an SMS step
+        """Process an SMS step"""
+        template = step.template
+        if not template:
+            logger.error(f"SMS step {step.id} has no template")
+            return {'success': False}
 
-        Returns a result dict with:
-            success: Whether the SMS was sent successfully
-            transition_immediately: Whether to transition immediately to next step
-        """
-        if not step.template:
-            logger.error(f"SMS step {step.name} has no template")
-            self._create_event(participant, step, 'error', {
-                'error': 'No template configured for SMS step'
-            })
-            return {'success': False, 'transition_immediately': False}
-
-        # Get the lead's phone number
-        lead = participant.lead
-        if not lead.phone_number:
-            logger.warning(f"Cannot send SMS to lead {lead.id} with no phone number")
-            self._create_event(participant, step, 'error', {
-                'error': 'Lead has no phone number'
-            })
-            return {'success': False, 'transition_immediately': True}
-
+        # Send SMS using template
+        # Implementation depends on your SMS sending service
         try:
-            # Create the event first (would be updated with tracking info)
-            event = self._create_event(participant, step, 'action_sent', {
-                'action_type': 'sms',
-                'template_id': str(step.template.id),
-                'recipient': lead.phone_number
+            # TODO: Implement SMS sending
+            self._create_event(participant, step, 'action_sent', {
+                'template_id': str(template.id)
             })
-
-            # This is where you would integrate with your SMS service
-            # For example:
-            # sms_service.send_sms(
-            #     to_phone=lead.phone_number,
-            #     template_id=step.template.id,
-            #     context={
-            #         'lead': lead,
-            #         'participant': participant,
-            #         'journey': participant.journey,
-            #         'tracking_id': str(event.id) if event else None
-            #     }
-            # )
-
-            # For now, we'll just log the SMS sending
-            logger.info(f"Would send SMS to {lead.phone_number} using template {step.template.id}")
-
             return {'success': True, 'transition_immediately': True}
-
         except Exception as e:
-            logger.exception(f"Error sending SMS for {participant.id} at {step.name}: {e}")
-            self._create_event(participant, step, 'error', {
-                'error': str(e),
-                'action_type': 'sms'
+            logger.exception(f"Error sending SMS for step {step.id}: {e}")
+            return {'success': False}
+
+    def _process_voice_step(self, participant, step):
+        """Process a voice call step"""
+        template = step.template
+        if not template:
+            logger.error(f"Voice step {step.id} has no template")
+            return {'success': False}
+
+        # Make voice call using template
+        # Implementation depends on your voice calling service
+        try:
+            # TODO: Implement voice call
+            self._create_event(participant, step, 'action_sent', {
+                'template_id': str(template.id)
             })
-            return {'success': False, 'transition_immediately': True}
+            return {'success': True, 'transition_immediately': True}
+        except Exception as e:
+            logger.exception(f"Error making voice call for step {step.id}: {e}")
+            return {'success': False}
 
-    def _process_delay_step(self, participant, step):
-        """
-        Process a delay step - these are just waiting points
-        The actual delay is handled by the delay connection
+    def _process_chat_step(self, participant, step):
+        """Process a chat message step"""
+        template = step.template
+        if not template:
+            logger.error(f"Chat step {step.id} has no template")
+            return {'success': False}
 
-        Returns a result dict with:
-            success: Always true
-            transition_immediately: False (delays don't transition immediately)
-        """
-        # Delay steps don't do anything on their own - they're just waiting points
-        # Record that we're entering a delay
-        self._create_event(participant, step, 'delay_started', {
-            'delay_config': step.config
+        # Send chat message using template
+        # Implementation depends on your chat service
+        try:
+            # TODO: Implement chat message sending
+            self._create_event(participant, step, 'action_sent', {
+                'template_id': str(template.id)
+            })
+            return {'success': True, 'transition_immediately': True}
+        except Exception as e:
+            logger.exception(f"Error sending chat message for step {step.id}: {e}")
+            return {'success': False}
+
+    def _process_wait_step(self, participant, step):
+        """Process a wait step"""
+        duration = step.config.get('duration')
+        if not duration:
+            logger.error(f"Wait step {step.id} has no duration configured")
+            return {'success': False}
+
+        # Create wait event
+        self._create_event(participant, step, 'enter_step', {
+            'duration': duration
         })
 
-        return {'success': True, 'transition_immediately': False}
+        return {'success': True}
 
-    def _process_condition_step(self, participant, step):
-        """
-        Process a condition step
+    def _process_validation_step(self, participant, step):
+        """Process a validation step"""
+        validation_type = step.config.get('validation_type')
+        if not validation_type:
+            logger.error(f"Validation step {step.id} has no validation type configured")
+            return {'success': False}
 
-        Returns a result dict with:
-            success: Whether the condition evaluation succeeded
-            transition_immediately: False (condition transitions via specific paths)
-        """
-        config = step.config or {}
-        lead = participant.lead
+        # Create validation event
+        self._create_event(participant, step, 'enter_step', {
+            'validation_type': validation_type
+        })
 
-        try:
-            # Evaluate the condition using the condition evaluator
-            condition_met = self.condition_evaluator.evaluate(lead, config)
-
-            # Record the condition result
-            self._create_event(
-                participant,
-                step,
-                'condition_met' if condition_met else 'condition_not_met',
-                {
-                    'condition': config,
-                    'result': condition_met
-                }
-            )
-
-            # Find the right connection based on condition result
-            if condition_met:
-                # Find the "true" path
-                connections = step.next_connections.filter(
-                    Q(condition_label__iexact='true') |
-                    Q(condition_label__iexact='yes'),
-                    is_active=True
-                ).order_by('priority')
-            else:
-                # Find the "false" path
-                connections = step.next_connections.filter(
-                    Q(condition_label__iexact='false') |
-                    Q(condition_label__iexact='no'),
-                    is_active=True
-                ).order_by('priority')
-
-            if connections.exists():
-                self._transition_participant(participant, connections.first())
-                return {'success': True, 'transition_immediately': False}  # Already transitioned
-
-            # If no matching connection, try a default one
-            default_connections = step.next_connections.filter(
-                Q(condition_label__isnull=True) |
-                Q(condition_label__exact=''),
-                is_active=True
-            ).order_by('priority')
-
-            if default_connections.exists():
-                self._transition_participant(participant, default_connections.first())
-                return {'success': True, 'transition_immediately': False}  # Already transitioned
-
-            # If still no connections, log a warning
-            logger.warning(f"Condition step {step.name} has no valid next connections for result: {condition_met}")
-            return {'success': False, 'transition_immediately': False}
-
-        except Exception as e:
-            logger.exception(f"Error processing condition for {participant.id} at {step.name}: {e}")
-            self._create_event(participant, step, 'error', {
-                'error': str(e),
-                'condition': config
-            })
-            return {'success': False, 'transition_immediately': True}
+        return {'success': True}
 
     def _process_goal_step(self, participant, step):
-        """
-        Process a goal step - these represent achievement of a goal
-
-        Returns a result dict with:
-            success: Always true
-            transition_immediately: True (goals always transition to next step)
-        """
-        # Record goal achievement
-        self._create_event(participant, step, 'goal_achieved', {
-            'goal_type': step.config.get('goal_type'),
-            'goal_value': step.config.get('goal_value')
+        """Process a goal step"""
+        # Create goal event
+        self._create_event(participant, step, 'enter_step', {
+            'goal_type': step.config.get('goal_type', 'default')
         })
 
-        # Goals automatically transition to the next step
         return {'success': True, 'transition_immediately': True}
 
     def _process_webhook_step(self, participant, step):
-        """
-        Process a webhook step - calls an external API
+        """Process a webhook step"""
+        url = step.config.get('url')
+        if not url:
+            logger.error(f"Webhook step {step.id} has no URL configured")
+            return {'success': False}
 
-        Returns a result dict with:
-            success: Whether the webhook call succeeded
-            transition_immediately: True (webhooks transition after completion)
-        """
-        webhook_config = step.config or {}
-        webhook_url = webhook_config.get('url')
-        method = webhook_config.get('method', 'POST')
-
-        if not webhook_url:
-            logger.error(f"Webhook step {step.name} has no URL configured")
-            self._create_event(participant, step, 'error', {
-                'error': 'No webhook URL configured'
-            })
-            return {'success': False, 'transition_immediately': True}
+        method = step.config.get('method', 'POST')
+        headers = step.config.get('headers', {})
+        payload = step.config.get('payload', {})
 
         try:
-            # Prepare data for the webhook
-            lead = participant.lead
-            webhook_data = {
-                'participant_id': str(participant.id),
-                'lead_id': str(lead.id),
-                'journey_id': str(participant.journey.id),
-                'step_id': str(step.id),
-                'timestamp': timezone.now().isoformat(),
-                'lead_data': {
-                    'first_name': lead.first_name,
-                    'last_name': lead.last_name,
-                    'email': lead.email,
-                    'phone_number': lead.phone_number,
-                },
-                'custom_data': webhook_config.get('custom_data', {})
-            }
-
-            # This would call your actual webhook service
-            # For now, we'll just log the webhook call
-            logger.info(f"Would call webhook at {webhook_url} with method {method}")
-
-            # In a real implementation:
-            # response = self._call_webhook(webhook_url, method, webhook_data)
-
-            # Record the webhook call
+            # Call webhook
+            response = self._call_webhook(url, method, headers, payload)
+            
+            # Create webhook event
             self._create_event(participant, step, 'action_sent', {
-                'action_type': 'webhook',
-                'webhook_url': webhook_url,
-                'webhook_method': method,
-                'webhook_data': webhook_data,
-                # 'webhook_response': response
+                'url': url,
+                'method': method,
+                'response_status': response.status_code
             })
 
             return {'success': True, 'transition_immediately': True}
-
         except Exception as e:
-            logger.exception(f"Error calling webhook for {participant.id} at {step.name}: {e}")
-            self._create_event(participant, step, 'error', {
-                'error': str(e),
-                'action_type': 'webhook'
-            })
-            return {'success': False, 'transition_immediately': True}
+            logger.exception(f"Error calling webhook for step {step.id}: {e}")
+            return {'success': False}
 
     def _process_end_step(self, participant, step):
-        """
-        Process an end step - completes the journey for this participant
-
-        Returns a result dict with:
-            success: Always true
-            transition_immediately: False (end steps don't transition)
-        """
-        # Mark the participant as completed
-        participant.status = 'completed'
-        participant.save(update_fields=['status', 'updated_at'])
-
-        # Record the journey completion
-        self._create_event(participant, step, 'exit_journey', {
-            'completion_type': 'normal',
-            'journey_id': str(participant.journey.id),
-            'duration_seconds': (timezone.now() - participant.entered_at).total_seconds()
+        """Process an end step"""
+        # Create end event
+        self._create_event(participant, step, 'enter_step', {
+            'end_type': step.config.get('end_type', 'default')
         })
 
-        logger.info(f"Participant {participant.id} completed journey {participant.journey.name}")
-        return {'success': True, 'transition_immediately': False}
+        # Mark participant as completed
+        participant.status = 'completed'
+        participant.save()
 
-    # Utility methods for external services
+        return {'success': True}
 
-    def _call_webhook(self, url, method, data):
-        """
-        Call a webhook URL
-
-        Args:
-            url: Webhook URL
-            method: HTTP method (GET, POST, etc.)
-            data: Data to send
-
-        Returns:
-            Response text
-        """
+    def _call_webhook(self, url, method, headers, data):
+        """Make an HTTP request to a webhook URL"""
         import requests
 
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'Novaura-Journey-Processor/1.0'
-        }
-
-        if method.upper() == 'GET':
-            response = requests.get(
-                url,
-                params=data,
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
                 headers=headers,
-                timeout=10  # 10 second timeout
-            )
-        else:
-            response = requests.post(
-                url,
                 json=data,
-                headers=headers,
-                timeout=10  # 10 second timeout
+                timeout=30
             )
-
-        response.raise_for_status()
-        return response.text
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            logger.exception(f"Webhook request failed: {e}")
+            raise

@@ -6,6 +6,7 @@ import boto3
 from botocore.exceptions import ClientError
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 from journey_processor.services.journey_processor import JourneyProcessor
 
@@ -150,6 +151,20 @@ def publish_journey_event(event_type, data, queue_url=None, delay_seconds=0):
                 'StringValue': str(data['lead_id'])
             }
 
+        # Add participant_id as attribute if available
+        if 'participant_id' in data:
+            message_attributes['ParticipantId'] = {
+                'DataType': 'String',
+                'StringValue': str(data['participant_id'])
+            }
+
+        # Add connection_id as attribute if available
+        if 'connection_id' in data:
+            message_attributes['ConnectionId'] = {
+                'DataType': 'String',
+                'StringValue': str(data['connection_id'])
+            }
+
         # Prepare message body
         message_body = json.dumps({
             'event_type': event_type,
@@ -227,6 +242,20 @@ def process_batch_journey_events(events, queue_url=None):
                     'StringValue': str(data['lead_id'])
                 }
 
+            # Add participant_id as attribute if available
+            if 'participant_id' in data:
+                message_attributes['ParticipantId'] = {
+                    'DataType': 'String',
+                    'StringValue': str(data['participant_id'])
+                }
+
+            # Add connection_id as attribute if available
+            if 'connection_id' in data:
+                message_attributes['ConnectionId'] = {
+                    'DataType': 'String',
+                    'StringValue': str(data['connection_id'])
+                }
+
             # Create entry
             entries.append({
                 'Id': f'msg-{i}',  # Unique ID for this batch
@@ -248,32 +277,31 @@ def process_batch_journey_events(events, queue_url=None):
             Entries=entries
         )
 
-        # Check for failures
-        if 'Failed' in response and response['Failed']:
-            logger.warning(f"Some batch events failed: {response['Failed']}")
+        if 'Failed' in response:
+            logger.warning(f"Failed to send {len(response['Failed'])} messages in batch")
+            for failure in response['Failed']:
+                logger.warning(f"Failed message {failure['Id']}: {failure['Message']}")
 
-        logger.info(f"Published {len(entries)} events to SQS in batch")
         return response
 
     except ClientError as e:
-        logger.exception(f"AWS SQS client error publishing batch events: {e}")
+        logger.exception(f"AWS SQS client error in batch processing: {e}")
         return None
 
     except Exception as e:
-        logger.exception(f"Unexpected error publishing batch events: {e}")
+        logger.exception(f"Unexpected error in batch processing: {e}")
         return None
 
 
 def purge_journey_queue(queue_url=None):
     """
     Purge all messages from the journey events queue
-    Use with caution - this deletes ALL messages in the queue
 
     Args:
         queue_url: SQS queue URL (defaults to settings.JOURNEY_EVENTS_QUEUE_URL)
 
     Returns:
-        bool: Success or failure
+        bool: True if successful, False otherwise
     """
     if not queue_url:
         queue_url = settings.JOURNEY_EVENTS_QUEUE_URL
@@ -284,11 +312,8 @@ def purge_journey_queue(queue_url=None):
 
     try:
         sqs = boto3.client('sqs')
-
-        # Purge the queue
         sqs.purge_queue(QueueUrl=queue_url)
-
-        logger.warning(f"Purged all messages from queue: {queue_url}")
+        logger.info("Successfully purged journey events queue")
         return True
 
     except ClientError as e:
@@ -325,38 +350,23 @@ def get_queue_statistics(queue_url=None):
             QueueUrl=queue_url,
             AttributeNames=[
                 'ApproximateNumberOfMessages',
-                'ApproximateNumberOfMessagesNotVisible',
                 'ApproximateNumberOfMessagesDelayed',
+                'ApproximateNumberOfMessagesNotVisible',
                 'CreatedTimestamp',
                 'LastModifiedTimestamp',
-                'VisibilityTimeout',
-                'MaximumMessageSize',
-                'MessageRetentionPeriod',
-                'DelaySeconds',
-                'ReceiveMessageWaitTimeSeconds'
+                'QueueArn'
             ]
         )
 
         attributes = response.get('Attributes', {})
 
-        # Format the statistics
-        statistics = {
-            'queue_url': queue_url,
-            'messages_available': int(attributes.get('ApproximateNumberOfMessages', 0)),
-            'messages_in_flight': int(attributes.get('ApproximateNumberOfMessagesNotVisible', 0)),
-            'messages_delayed': int(attributes.get('ApproximateNumberOfMessagesDelayed', 0)),
-            'total_messages': int(attributes.get('ApproximateNumberOfMessages', 0)) +
-                              int(attributes.get('ApproximateNumberOfMessagesNotVisible', 0)) +
-                              int(attributes.get('ApproximateNumberOfMessagesDelayed', 0)),
-            'visibility_timeout': int(attributes.get('VisibilityTimeout', 0)),
-            'message_retention_period': int(attributes.get('MessageRetentionPeriod', 0)) / 86400,  # Convert to days
-            'max_message_size': int(attributes.get('MaximumMessageSize', 0)) / 1024,  # Convert to KB
-            'delay_seconds': int(attributes.get('DelaySeconds', 0)),
-            'wait_time_seconds': int(attributes.get('ReceiveMessageWaitTimeSeconds', 0))
-        }
+        # Convert timestamp strings to datetime objects
+        if 'CreatedTimestamp' in attributes:
+            attributes['CreatedTimestamp'] = int(attributes['CreatedTimestamp'])
+        if 'LastModifiedTimestamp' in attributes:
+            attributes['LastModifiedTimestamp'] = int(attributes['LastModifiedTimestamp'])
 
-        logger.debug(f"Queue statistics: {statistics}")
-        return statistics
+        return attributes
 
     except ClientError as e:
         logger.exception(f"AWS SQS client error getting queue statistics: {e}")
@@ -373,29 +383,71 @@ def _handle_failed_messages(queue_url, failed_messages, sqs_client=None):
 
     Args:
         queue_url: SQS queue URL
-        failed_messages: List of tuples (message_id, receipt_handle, error)
-        sqs_client: Boto3 SQS client (optional)
+        failed_messages: List of tuples (message_id, receipt_handle, error_reason)
+        sqs_client: Optional boto3 SQS client
     """
-    if not sqs_client:
-        sqs_client = boto3.client('sqs')
+    if not failed_messages:
+        return
 
-    for message_id, receipt_handle, error in failed_messages:
-        try:
-            # Modify the visibility timeout to allow for retry
-            # A shorter timeout will make the message available sooner for retry
-            sqs_client.change_message_visibility(
-                QueueUrl=queue_url,
-                ReceiptHandle=receipt_handle,
-                VisibilityTimeout=60  # 1 minute - adjust as needed for your use case
-            )
+    try:
+        if not sqs_client:
+            sqs_client = boto3.client('sqs')
 
-            logger.info(f"Reset visibility timeout for failed message {message_id} to allow retry")
+        # Get queue attributes to check for dead letter queue
+        response = sqs_client.get_queue_attributes(
+            QueueUrl=queue_url,
+            AttributeNames=['RedrivePolicy']
+        )
 
-        except ClientError as e:
-            logger.error(f"Could not change visibility for message {message_id}: {e}")
+        redrive_policy = response.get('Attributes', {}).get('RedrivePolicy')
+        if redrive_policy:
+            try:
+                policy = json.loads(redrive_policy)
+                dead_letter_queue = policy.get('deadLetterTargetArn')
+                max_receives = policy.get('maxReceiveCount', 5)
+
+                # Move failed messages to dead letter queue
+                for message_id, receipt_handle, error_reason in failed_messages:
+                    try:
+                        # Get message attributes
+                        message = sqs_client.receive_message(
+                            QueueUrl=queue_url,
+                            MaxNumberOfMessages=1,
+                            ReceiptHandle=receipt_handle
+                        ).get('Messages', [{}])[0]
+
+                        # Send to dead letter queue
+                        sqs_client.send_message(
+                            QueueUrl=dead_letter_queue,
+                            MessageBody=message['Body'],
+                            MessageAttributes=message.get('MessageAttributes', {}),
+                            MessageDeduplicationId=message_id,
+                            MessageGroupId='failed-messages'
+                        )
+
+                        # Delete from original queue
+                        sqs_client.delete_message(
+                            QueueUrl=queue_url,
+                            ReceiptHandle=receipt_handle
+                        )
+
+                        logger.info(f"Moved failed message {message_id} to dead letter queue")
+
+                    except Exception as e:
+                        logger.exception(f"Error moving message {message_id} to dead letter queue: {e}")
+
+            except json.JSONDecodeError:
+                logger.error("Invalid RedrivePolicy JSON")
+
+        else:
+            # No dead letter queue configured, just log the failures
+            for message_id, receipt_handle, error_reason in failed_messages:
+                logger.error(f"Failed to process message {message_id}: {error_reason}")
+
+    except Exception as e:
+        logger.exception(f"Error handling failed messages: {e}")
 
 
 def _get_iso_timestamp():
-    """Get current time as ISO 8601 string"""
-    from datetime import datetime
-    return datetime.utcnow().isoformat() + 'Z'  # Z indicates UTC
+    """Get current timestamp in ISO format"""
+    return timezone.now().isoformat()

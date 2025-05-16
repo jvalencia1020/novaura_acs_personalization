@@ -13,6 +13,10 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 import pymysql
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 pymysql.install_as_MySQLdb()
 
@@ -24,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-kv_4!u3)1-m!_)1cmfww5=6dlqphr)d0!d%5^2%dikokopbg*x'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -46,11 +50,8 @@ INSTALLED_APPS = [
     'journey_processor',
 
     # Include these for ORM functionality, but we're not including views, etc.
-    'crm.apps.CrmConfig',
-    'accounts.apps.AccountsConfig',
-    'acs.apps.AcsConfig',
-    'personalization.apps.PersonalizationConfig',
-    'communications.apps.CommunicationsConfig',
+    'external_models',
+
 ]
 
 MIDDLEWARE = [
@@ -88,15 +89,20 @@ WSGI_APPLICATION = 'acs_personalization.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': os.getenv('DB_ENGINE'),
+        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.mysql'),
         'NAME': os.getenv('DB_NAME'),
         'USER': os.getenv('DB_USER'),
         'PASSWORD': os.getenv('DB_PASSWORD'),
         'HOST': os.getenv('DB_HOST'),
         'PORT': os.getenv('DB_PORT'),
+        'OPTIONS': {
+            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+            'charset': 'utf8mb4',
+            'connect_timeout': 60,
+        },
+        'CONN_MAX_AGE': 60,  # 1-minute connection persistence
     }
 }
-
 
 
 # Password validation
