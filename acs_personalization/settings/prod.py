@@ -9,9 +9,8 @@ import os
 DEBUG = False
 
 # Define allowed hosts for production
-ALLOWED_HOSTS = [
-    os.getenv('ALLOWED_HOSTS', '*').split(',')  # Get from environment variable or default to '*'
-]
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')  # Get from environment variable or default to '*'
+
 
 # Additional production-specific settings
 # AWS-specific settings would go here if needed

@@ -48,6 +48,7 @@ INSTALLED_APPS = [
 
     # Your apps
     'journey_processor',
+    'bulkcampaign_processor',
 
     # Include these for ORM functionality, but we're not including views, etc.
     'external_models',
@@ -192,6 +193,11 @@ LOGGING = {
             'propagate': False,
         },
         'journey_processor': {
+            'handlers': ['console'],
+            'level': JOURNEY_PROCESSOR_LOG_LEVEL,
+            'propagate': False,
+        },
+        'bulkcampaign_processor': {
             'handlers': ['console'],
             'level': JOURNEY_PROCESSOR_LOG_LEVEL,
             'propagate': False,
